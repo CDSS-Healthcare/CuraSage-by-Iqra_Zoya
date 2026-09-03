@@ -124,3 +124,232 @@ No explanation.
 Ranking: [/INST]
 ```
 
+
+# CuraSage — Core Algorithm Snippets
+
+The snippets below are the core algorithmic components referenced in the paper,
+provided. 
+
+---
+
+## 1. Weighted Consensus Scoring (Section 5.3, Eq. 2)
+
+Configuration weights:
+
+```python
+class Config:
+    def __init__(self, db_path: str, rules_path: str, guidelines_path: str):
+        self.min_support_threshold   = 5
+
+        self.markov_weight           = 0.5
+        self.semantic_weight         = 0.3
+        self.llm_validation_weight   = 0.1
+        self.guideline_weight        = 0.1
+```
+
+Core scoring loop (per candidate topic):
+
+```python
+markov_score   = self._get_markov_score(current_topic, topic_id)
+semantic_score = self._get_semantic_score(current_sequence, topic_id)
+
+guideline_boost = self.guideline_integrator.get_guideline_boost(
+    topic_id, patient_data or {})
+
+llm_score = 0.5
+if (self.config.use_llm_validation and self.llm_validator
+        and patient_data and len(scored) < 3):
+    source_name = self.db.get_topic_name(current_topic)
+    target_name = self.db.get_topic_name(topic_id)
+    llm_score, _ = self.llm_validator.validate_transition(
+        source_name, target_name,
+        patient_data.get('age', 50),
+        patient_data.get('gender', 'Unknown'))
+
+valid_transition, _ = self.rule_engine.is_valid_transition(
+    current_topic, topic_id)
+if not valid_transition:
+    continue
+
+base_score = (
+    markov_score   * self.config.markov_weight +
+    semantic_score * self.config.semantic_weight +
+    llm_score      * self.config.llm_validation_weight
+) * guideline_boost
+
+# Apply vital constraints
+cat        = self.db.get_topic_category(topic_id)
+base_score = self.vital_engine.apply_to_score(
+    base_score, cat, vital_constraints,
+    boost_mult=self.config.vital_boost_multiplier,
+    block_mult=self.config.vital_block_multiplier)
+
+base_score *= self._get_patient_context_score(topic_id, patient_data)
+
+if base_score >= self.config.min_acceptable_confidence:
+    scored.append({'topic_id': topic_id, 'probability': base_score, ...})
+```
+
+---
+
+## 2. Markov Transition Matrix (Section 4.2, 5.3.1)
+
+Graph construction from stored transition statistics:
+
+```python
+def _build_graph(self):
+    transitions = self.db.get_topic_transitions()
+    for trans in transitions:
+        source = trans['source_topic_id']
+        target = trans['target_topic_id']
+
+        self.graph.add_node(source)
+        self.graph.add_node(target)
+
+        self.graph.add_edge(
+            source, target,
+            weight=trans['confidence_score'],
+            count=trans['transition_count'],
+            avg_time=trans['avg_time_gap_hours'],
+        )
+```
+
+Transition-probability lookup used in scoring:
+
+```python
+def _get_markov_score(self, source: int, target: int) -> float:
+    if source in self.graph.graph and target in self.graph.graph[source]:
+        return self.graph.graph[source][target]['weight']
+    return 0.0
+```
+
+(Edges below `min_support_threshold = 5` are excluded upstream when the
+transition statistics table is populated.)
+
+---
+
+## 3. BioMistral-7B Single-Pair Validation (Section 5.3.3)
+
+Model loading (with 8-bit fallback):
+
+```python
+model_name = "BioMistral/BioMistral-7B"
+
+self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+self.model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+    low_cpu_mem_usage=True,
+)
+# On failure, falls back to 8-bit quantization via BitsAndBytesConfig
+```
+
+Safety-filter shortcuts and LLM call:
+
+```python
+def validate_transition(self, source_topic, target_topic,
+                         patient_age, patient_gender):
+    target_lower = target_topic.lower()
+
+    if patient_age > 18:
+        for term in ['neonate', 'infant', 'newborn', 'baby', 'pediatric']:
+            if term in target_lower:
+                return 0.1, "neonatal topic for adult"
+    if patient_age < 40:
+        for term in ['elderly', 'geriatric', 'dementia']:
+            if term in target_lower:
+                return 0.1, "geriatric topic for young"
+    if 'discharge' in target_lower:
+        return 0.9, "discharge is appropriate"
+
+    prompt = (
+        f"<s>[INST] You are a clinical expert. Determine if this medical "
+        f"transition makes clinical sense.\n\n"
+        f"Patient: {patient_age} year old {patient_gender}\n"
+        f"Current state: {source_topic}\nNext step: {target_topic}\n\n"
+        f"Answer with a single number 0-1 (0=wrong, 1=appropriate).\n"
+        f"Score: [/INST]"
+    )
+
+    outputs = self.generator(prompt, max_new_tokens=20,
+                              pad_token_id=self.tokenizer.pad_token_id)
+    generated = outputs[0]['generated_text'].split('[/INST]')[-1].strip()
+    numbers = re.findall(r'0\.\d+|\b[01]\b', generated)
+    score = float(min(max(float(numbers[0]), 0), 1)) if numbers else 0.5
+    return score, "BioMistral validated"
+```
+
+---
+
+## 4. Topic Modeling Configuration (Section 4.1, BERTopic/UMAP/HDBSCAN)
+
+```python
+def build_topic_model(params):
+    vectorizer = CountVectorizer(
+        stop_words=list(STOPWORDS),
+        ngram_range=params["ngram"],
+        token_pattern=r"(?u)\b[a-z]*[a-z][a-z]{2,}\b",
+    )
+
+    umap_model = UMAP(
+        n_neighbors=params["n_neighbors"],
+        n_components=params["n_components"],
+        min_dist=params["min_dist"],
+        metric="cosine",
+        random_state=RANDOM_SEED,
+    )
+
+    hdbscan_model = hdbscan.HDBSCAN(
+        min_cluster_size=params["min_cluster_size"],
+        min_samples=params["min_samples"],
+        prediction_data=True,
+    )
+
+    return BERTopic(
+        embedding_model=EMBED_MODEL,          # emilyalsentzer/Bio_ClinicalBERT
+        vectorizer_model=vectorizer,
+        umap_model=umap_model,
+        hdbscan_model=hdbscan_model,
+        language="english",
+    )
+```
+
+Best hyperparameters are selected by grid search over `c_v` topic
+coherence on a subset of patients (`SUBSET_PATIENT_RATIO = 0.15`,
+`RANDOM_SEED = 42`) and stored in `best_params.json`.
+
+---
+
+## 5. Data Preprocessing Example (Section 3.2.1)
+
+Representative table-specific cleaning function (diagnosis codes):
+
+```python
+def preprocess_DIAGNOSES_ICD_SORTED(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = pd.read_csv("data/raw/D_ICD_DIAGNOSES.csv")
+
+    df = df.dropna(subset=['ICD9_CODE'])
+
+    mapping_dict = dict(zip(mapping['ICD9_CODE'].astype(str),
+                             mapping['LONG_TITLE']))
+    df['ICD9_CODE'] = df['ICD9_CODE'].astype(str)
+    df['ICD9_DESCRIPTION'] = df['ICD9_CODE'].map(mapping_dict)
+
+    df_grouped = (
+        df.groupby(['SUBJECT_ID', 'HADM_ID'])['ICD9_DESCRIPTION']
+        .apply(lambda x: ', '.join(sorted(set(x.dropna()))))
+        .reset_index()
+    )
+
+    return df_grouped.rename(columns={'ICD9_DESCRIPTION': 'ICD9_CODES'})
+```
+
+Every other clinical table (procedures, lab events, medications, etc.)
+follows the same pattern: validate required columns, map coded fields to
+their MIMIC-III reference descriptions, and group by patient/admission.
+
+---
+
+**Note:** These snippets are illustrative excerpts. Full reproducibility details (model versions, all
+hyperparameters, prompts, and seeds) are provided in `REPRODUCIBILITY.txt`.
