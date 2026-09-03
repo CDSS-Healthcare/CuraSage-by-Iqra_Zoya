@@ -350,6 +350,3 @@ follows the same pattern: validate required columns, map coded fields to
 their MIMIC-III reference descriptions, and group by patient/admission.
 
 ---
-
-**Note:** These snippets are illustrative excerpts. Full reproducibility details (model versions, all
-hyperparameters, prompts, and seeds) are provided in `REPRODUCIBILITY.txt`.
